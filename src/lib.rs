@@ -1,11 +1,9 @@
 // #![deny(missing_docs)]
 //! This is documentation for the `kv` crate.
 
-use std::collections::HashSet;
-use std::error::Error;
 use std::ffi::OsStr;
-use std::fs::{self, create_dir_all, DirEntry, File};
-use std::io::{self, BufReader, BufWriter, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, SeekFrom, Write};
 use std::io::{Read, Seek};
 use std::path::PathBuf;
 use std::{collections::HashMap, path::Path};
@@ -14,25 +12,147 @@ pub mod error;
 use error::{KvStoreError, Result};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Deserializer;
+use serde_json::de::IoRead;
+use serde_json::{Deserializer, StreamDeserializer};
 
 // Stale byte count size to trigger compaction
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
+
+#[derive(Debug)]
+struct LogReader {
+    log_gen: u64,
+    reader: BufReader<File>,
+}
+
+impl LogReader {
+    pub fn new(path: &Path, log_gen: u64) -> Result<LogReader> {
+        let log_file_path = log_path(&path, log_gen);
+        let file = File::open(log_file_path)?;
+
+        return Ok(LogReader {
+            log_gen,
+            reader: BufReader::new(file),
+        });
+    }
+
+    pub fn read_pointer(&mut self, log_pointer: &LogPointer) -> Result<Option<String>> {
+        let pos = log_pointer.pos;
+        let len = log_pointer.len;
+
+        let reader = &mut self.reader;
+        reader.seek(SeekFrom::Start(pos))?;
+
+        let cmd_reader = reader.take(len);
+
+        if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
+            Ok(Some(value))
+        } else {
+            Err(KvStoreError::UnexpectedCommandType)
+        }
+    }
+
+    pub fn iter(&mut self) -> LogIterator {
+        return LogIterator::from_reader(self.log_gen, &mut self.reader);
+    }
+}
+
+struct LogIterator<'a> {
+    log_gen: u64,
+    deserializer: StreamDeserializer<'a, IoRead<&'a mut BufReader<File>>, Command>,
+}
+
+impl LogIterator<'_> {
+    pub fn from_reader<'a>(log_gen: u64, reader: &'a mut BufReader<File>) -> LogIterator<'a> {
+        let deserializer = Deserializer::from_reader(reader).into_iter::<Command>();
+        return LogIterator {
+            log_gen,
+            deserializer,
+        };
+    }
+}
+
+impl Iterator for LogIterator<'_> {
+    type Item = Result<(Command, LogPointer)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let pos = self.deserializer.byte_offset() as u64;
+        let next = self.deserializer.next()?;
+        let next_pos = self.deserializer.byte_offset() as u64;
+
+        let len = next_pos - pos;
+
+        let log_pointer = LogPointer {
+            len,
+            log_gen: self.log_gen,
+            pos,
+        };
+
+        Some(
+            next.map(|cmd| (cmd, log_pointer))
+                .map_err(KvStoreError::SerdeErr),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct LogWriter {
+    log_pos: u64,
+    log_gen: u64,
+    writer: BufWriter<File>,
+}
+
+impl LogWriter {
+    pub fn new(path: &Path, log_gen: u64) -> Result<LogWriter> {
+        let log_file_path = log_path(&path, log_gen);
+        let file = File::create(log_file_path)?;
+
+        return Ok(LogWriter {
+            log_pos: 0,
+            log_gen,
+            writer: BufWriter::new(file),
+        });
+    }
+
+    pub fn write_set_cmd(&mut self, key: String, value: String) -> Result<LogPointer> {
+        let cmd = Command::Set { key, value };
+        let pos = self.log_pos;
+
+        let len = self.writer.write(&serde_json::to_vec(&cmd)?)? as u64;
+        self.writer.flush()?;
+
+        self.log_pos += len;
+
+        Ok(LogPointer {
+            log_gen: self.log_gen,
+            pos,
+            len,
+        })
+    }
+
+    pub fn write_rm_cmd(&mut self, key: String) -> Result<()> {
+        let cmd = Command::Remove { key };
+
+        let len = self.writer.write(&serde_json::to_vec(&cmd)?)? as u64;
+        self.writer.flush()?;
+
+        self.log_pos += len;
+
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 /** A simple key-value store */
 pub struct KvStore {
     path: PathBuf,
     keydir: Keydir,
-    readers: Readers,
-    writer: BufWriter<File>,
+    readers: HashMap<u64, LogReader>,
+    writer: LogWriter,
     log_gen: u64,
-    log_pos: u64,
     stale_logs_size: u64,
 }
 
 type Keydir = HashMap<String, LogPointer>;
-type Readers = HashMap<u64, BufReader<File>>;
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Command {
@@ -70,36 +190,24 @@ fn sorted_log_gens(path: &PathBuf) -> Result<Vec<u64>> {
     Ok(log_entries)
 }
 
-fn index_logs(
-    keydir: &mut Keydir,
-    path: &PathBuf,
-) -> Result<(HashMap<u64, BufReader<File>>, u64, u64)> {
-    let mut readers: HashMap<u64, BufReader<File>> = HashMap::new();
+fn index_logs(keydir: &mut Keydir, path: &PathBuf) -> Result<(HashMap<u64, LogReader>, u64, u64)> {
+    let mut readers: HashMap<u64, LogReader> = HashMap::new();
 
     let log_gens = sorted_log_gens(&path)?;
 
     let mut stale_logs_size: u64 = 0;
 
     for &log_gen in &log_gens {
-        let log_file_path = log_path(&path, log_gen);
-        let file = File::open(log_file_path)?;
-        let mut reader = BufReader::new(file);
+        let mut reader = LogReader::new(&path, log_gen)?;
+        let mut commands = reader.iter();
 
-        let mut deserializer = Deserializer::from_reader(&mut reader).into_iter::<Command>();
-
-        let mut pos = 0;
-
-        while let Some(cmd) = deserializer.next() {
-            let next_pos = deserializer.byte_offset() as u64;
-
-            let len = next_pos - pos;
-
-            match cmd? {
+        while let Some(Ok((cmd, log_pointer))) = commands.next() {
+            match cmd {
                 Command::Set { key, .. } => {
                     if let Some(existing_value) = keydir.get(&key) {
                         stale_logs_size += existing_value.len;
                     }
-                    keydir.insert(key, LogPointer { log_gen, pos, len });
+                    keydir.insert(key, log_pointer);
                 }
                 Command::Remove { key } => {
                     if let Some(existing_value) = keydir.get(&key) {
@@ -108,8 +216,6 @@ fn index_logs(
                     keydir.remove(&key);
                 }
             };
-
-            pos = next_pos
         }
 
         readers.insert(log_gen, reader);
@@ -126,21 +232,6 @@ fn log_path(dir: &Path, gen: u64) -> PathBuf {
     dir.join(format!("{}.log", gen))
 }
 
-fn read_log_pointer(log_pointer: &LogPointer, readers: &mut Readers) -> Result<Option<String>> {
-    let reader = readers
-        .get_mut(&log_pointer.log_gen)
-        .expect("Cannot find log reader");
-
-    reader.seek(SeekFrom::Start(log_pointer.pos))?;
-
-    let cmd_reader = reader.take(log_pointer.len);
-    if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
-        Ok(Some(value))
-    } else {
-        Err(KvStoreError::UnexpectedCommandType)
-    }
-}
-
 impl KvStore {
     /** Create a simple key-value store */
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
@@ -150,13 +241,9 @@ impl KvStore {
         let mut keydir: Keydir = HashMap::new();
         let (mut readers, current_log_gen, stale_logs_size) = index_logs(&mut keydir, &path)?;
 
-        // println!("keydir on startup: {:#?}", keydir);
+        let writer = LogWriter::new(&path, current_log_gen)?;
 
-        let current_log_file = log_path(&path, current_log_gen);
-        let file = File::create(current_log_file.clone())?;
-        let writer = BufWriter::new(file);
-
-        let current_reader = BufReader::new(File::open(current_log_file)?);
+        let current_reader = LogReader::new(&path, current_log_gen)?;
         readers.insert(current_log_gen, current_reader);
 
         return Ok(KvStore {
@@ -165,7 +252,6 @@ impl KvStore {
             writer,
             keydir,
             log_gen: current_log_gen,
-            log_pos: 0,
             stale_logs_size,
         });
     }
@@ -173,21 +259,7 @@ impl KvStore {
     /** Set a key to the given value */
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         // println!("Setting key: {} to value: {}", &key, &value);
-        let cmd = Command::Set {
-            key: key.clone(),
-            value: value,
-        };
-
-        let len = self.writer.write(&serde_json::to_vec(&cmd)?)? as u64;
-        self.writer.flush()?;
-
-        // println!("log pos: {}, len: {}", self.log_pos, len);
-
-        let log_pointer = LogPointer {
-            log_gen: self.log_gen,
-            pos: self.log_pos,
-            len,
-        };
+        let log_pointer = self.writer.write_set_cmd(key.clone(), value)?;
 
         // println!("log pointer: {:#?}", log_pointer);
 
@@ -196,9 +268,8 @@ impl KvStore {
         }
 
         self.keydir.insert(key, log_pointer);
-        self.log_pos += len;
-
         self.maybe_compact()?;
+
         Ok(())
     }
 
@@ -209,19 +280,15 @@ impl KvStore {
             return Err(KvStoreError::UnknownKeyError);
         }
 
-        let cmd = Command::Remove { key: key.clone() };
-
-        let offset = self.writer.write(&serde_json::to_vec(&cmd)?)?;
-        self.writer.flush()?;
+        self.writer.write_rm_cmd(key.clone())?;
 
         if let Some(existing_value) = self.keydir.get(&key) {
             self.stale_logs_size += existing_value.len;
         }
 
         self.keydir.remove(&key);
-        self.log_pos += offset as u64;
-
         self.maybe_compact()?;
+
         Ok(())
     }
 
@@ -232,7 +299,10 @@ impl KvStore {
 
         if let Some(log_pointer) = self.keydir.get(&key) {
             // println!("log_pointer: {:#?}", log_pointer);
-            read_log_pointer(log_pointer, &mut self.readers)
+            self.readers
+                .get_mut(&log_pointer.log_gen)
+                .expect("Expected log reader")
+                .read_pointer(log_pointer)
         } else {
             Ok(None)
         }
@@ -259,7 +329,12 @@ impl KvStore {
         let mut pos = 0;
 
         for (key, log_pointer) in self.keydir.iter() {
-            if let Some(value) = read_log_pointer(log_pointer, &mut self.readers)? {
+            let reader = self
+                .readers
+                .get_mut(&log_pointer.log_gen)
+                .expect("Expected reader");
+
+            if let Some(value) = reader.read_pointer(log_pointer)? {
                 // Write to new file
                 let cmd = Command::Set {
                     key: key.clone(),
@@ -287,14 +362,11 @@ impl KvStore {
 
         // Set up the reader to the compact log and the writer to the new log file
         self.readers = HashMap::new();
-        self.readers.insert(
-            compact_log_gen,
-            BufReader::new(File::open(&compact_log_path)?),
-        );
+        let current_reader = LogReader::new(&self.path, compact_log_gen)?;
+        self.readers.insert(compact_log_gen, current_reader);
 
         let new_log_gen = compact_log_gen + 1;
-        let new_log_file = File::create(log_path(&self.path, new_log_gen))?;
-        self.writer = BufWriter::new(new_log_file);
+        self.writer = LogWriter::new(&self.path, new_log_gen)?;
 
         // Delete the old log files
         for old_log_gen in old_log_gens {
@@ -303,7 +375,6 @@ impl KvStore {
 
         self.keydir = new_keydir;
         self.log_gen = new_log_gen;
-        self.log_pos = 0;
         self.stale_logs_size = 0;
 
         // println!("Compacting finished: {:#?}", self);
