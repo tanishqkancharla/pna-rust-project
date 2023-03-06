@@ -9,7 +9,10 @@ use std::io;
 pub enum KvStoreError {
     IoErr(io::Error),
     SerdeErr(serde_json::Error),
+    StringError(String),
+    /// This key doesn't exist in this store
     UnknownKeyError,
+    /// An unexpected command in the store
     UnexpectedCommandType,
 }
 
@@ -40,6 +43,7 @@ impl fmt::Display for KvStoreError {
         match self {
             Self::IoErr(ref err) => err.fmt(f),
             Self::SerdeErr(ref err) => err.fmt(f),
+            Self::StringError(ref err) => err.fmt(f),
             Self::UnknownKeyError => write!(f, "Key not found"),
             Self::UnexpectedCommandType => write!(f, "Unexpected command"),
         }

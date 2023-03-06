@@ -13,16 +13,31 @@ tempfile = "3.3.0"
 walkdir = "2.3.2"
 rand = "0.8.5"
 
+[[bench]]
+name = "my_benchmark"
+harness = false
+
 [dependencies]
 clap = { version = "4.1.1", features = ["derive"] }
+rand = {version = "0.8.5", features = ["small_rng"]}
+random-string = "1.0.0"
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = "1.0.91"
+sled = "0.34.7"
+slog = "2.7.0"
+slog-term = "2.9.0"
+websocket = "0.26.5"
 
 [lib]
 test = false
 doctest = false
 
 [[bin]]
-name = "kvs"
+name = "kvs-client"
+test = false
+doctest = false
+
+[[bin]]
+name = "kvs-server"
 test = false
 doctest = false
