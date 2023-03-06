@@ -51,13 +51,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     );
 
+    let dir = current_dir()?;
+
     match args.engine {
         Engine::Kvs => {
-            let mut server = KvsServer::new(log, Box::new(KvStore::open(current_dir()?)?));
+            let mut server = KvsServer::new(log, KvStore::open(dir)?);
             server.listen(args.addr)?;
         }
         Engine::Sled => {
-            let mut server = KvsServer::new(log, Box::new(SledKvsEngine::open(current_dir()?)?));
+            let mut server = KvsServer::new(log, SledKvsEngine::open(dir)?);
             server.listen(args.addr)?;
         }
     };

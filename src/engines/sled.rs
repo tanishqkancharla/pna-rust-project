@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub struct SledKvsEngine {
     db: sled::Db,
+    dirty_count: u64,
 }
 
 impl From<sled::Error> for KvStoreError {
@@ -11,16 +12,28 @@ impl From<sled::Error> for KvStoreError {
     }
 }
 
+const FLUSH_LIMIT: u64 = 1 << 12;
+
+impl SledKvsEngine {
+    fn maybe_flush(&mut self) -> crate::Result<()> {
+        if self.dirty_count > FLUSH_LIMIT {
+            self.db.flush()?;
+        }
+
+        Ok(())
+    }
+}
+
 impl KvsEngine for SledKvsEngine {
     fn open(path: PathBuf) -> Result<SledKvsEngine, KvStoreError> {
         let db = sled::open(path)?;
 
-        Ok(SledKvsEngine { db })
+        Ok(SledKvsEngine { db, dirty_count: 0 })
     }
 
     fn set(&mut self, key: String, value: String) -> crate::Result<()> {
         self.db.insert(key, value.as_bytes())?;
-        self.db.flush()?;
+        // self.maybe_flush()?;
 
         Ok(())
     }
@@ -47,8 +60,13 @@ impl KvsEngine for SledKvsEngine {
         }
 
         self.db.remove(key)?;
-        self.db.flush()?;
+        // self.maybe_flush()?;
 
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.db.flush()?;
         Ok(())
     }
 }

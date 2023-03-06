@@ -79,24 +79,22 @@ fn index_logs(keydir: &mut Keydir, path: &PathBuf) -> Result<(HashMap<u64, LogRe
 impl KvStore {
     fn maybe_compact(&mut self) -> Result<()> {
         if self.stale_logs_size > COMPACTION_THRESHOLD {
-            // println!("Triggered compaction");
             self.compact()?;
         }
         Ok(())
     }
 
     fn compact(&mut self) -> Result<()> {
+        self.writer.flush()?;
+
         // Write the current keydir into one new log file
-        let old_log_gens = self.readers.keys().cloned().collect::<Vec<u64>>();
         let compact_log_gen = self.log_gen + 1;
         let mut new_keydir: Keydir = HashMap::new();
 
         let compact_log_path = log_path(&self.path, compact_log_gen);
-        // println!("Compacting to path {:?}", &compact_log_path);
         let mut compact_log = BufWriter::new(File::create(&compact_log_path)?);
 
         let mut pos = 0;
-        println!("{:#?}", self.readers);
 
         for (key, log_pointer) in self.keydir.iter() {
             let reader = self
@@ -113,9 +111,6 @@ impl KvStore {
 
                 let len = compact_log.write(&serde_json::to_vec(&cmd)?)? as u64;
 
-                if key == "key0" {
-                    "hello";
-                }
                 let new_log_pointer = LogPointer {
                     len,
                     log_gen: compact_log_gen,
@@ -123,7 +118,7 @@ impl KvStore {
                 };
 
                 // Remake the keydir with the new log pointer
-                new_keydir.insert(key.to_string(), new_log_pointer);
+                new_keydir.insert(key.clone(), new_log_pointer);
                 pos += len;
             }
         }
@@ -139,7 +134,10 @@ impl KvStore {
         self.writer = LogWriter::new(&self.path, new_log_gen)?;
 
         // Delete the old log files
-        for old_log_gen in old_log_gens {
+        for &old_log_gen in self.readers.keys() {
+            if old_log_gen == compact_log_gen {
+                continue;
+            }
             fs::remove_file(log_path(&self.path, old_log_gen))?;
         }
 
@@ -176,6 +174,7 @@ impl KvsEngine for KvStore {
             stale_logs_size,
         });
     }
+
     /** Set a key to the given value */
     fn set(&mut self, key: String, value: String) -> Result<()> {
         // println!("Setting key: {} to value: {}", &key, &value);
@@ -226,5 +225,10 @@ impl KvsEngine for KvStore {
         } else {
             Ok(None)
         }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()?;
+        Ok(())
     }
 }

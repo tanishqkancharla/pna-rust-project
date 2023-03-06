@@ -14,11 +14,11 @@ use slog::{error, info, Logger};
 
 pub struct KvsServer<Engine: KvsEngine> {
     logger: Logger,
-    engine: Box<Engine>,
+    engine: Engine,
 }
 
 impl<Engine: KvsEngine> KvsServer<Engine> {
-    pub fn new(logger: Logger, engine: Box<Engine>) -> KvsServer<Engine> {
+    pub fn new(logger: Logger, engine: Engine) -> KvsServer<Engine> {
         return KvsServer { logger, engine };
     }
 
@@ -57,8 +57,11 @@ impl<Engine: KvsEngine> KvsServer<Engine> {
 
             info!(self.logger, "Sending response: {:?}", response);
             serde_json::to_writer(&mut writer, &response)?;
+
             writer.flush()?;
         }
+
+        self.engine.flush()?;
 
         Ok(())
     }

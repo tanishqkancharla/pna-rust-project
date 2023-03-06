@@ -53,6 +53,8 @@ pub fn test_reads<Engine: KvsEngine>(b: &mut Bencher, thread_rng: ThreadRng) {
             .unwrap();
     }
 
+    store.flush().unwrap();
+
     b.iter(|| {
         store
             .get(format!("key{}", rng.gen_range(1..key_count)))

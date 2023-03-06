@@ -2,12 +2,11 @@ use serde_json::{de::IoRead, Deserializer, StreamDeserializer};
 
 use crate::{KvStoreError, Result};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, SeekFrom, Write};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, SeekFrom, Write};
 use std::io::{Read, Seek};
+use std::path::Path;
 use std::path::PathBuf;
-use std::{collections::HashMap, path::Path};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Command {
@@ -132,7 +131,7 @@ impl LogWriter {
         let pos = self.log_pos;
 
         let len = self.writer.write(&serde_json::to_vec(&cmd)?)? as u64;
-        self.writer.flush()?;
+        // self.writer.flush()?;
 
         self.log_pos += len;
 
@@ -147,10 +146,14 @@ impl LogWriter {
         let cmd = Command::Remove { key };
 
         let len = self.writer.write(&serde_json::to_vec(&cmd)?)? as u64;
-        self.writer.flush()?;
+        // self.writer.flush()?;
 
         self.log_pos += len;
 
         Ok(())
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        return self.writer.flush();
     }
 }
